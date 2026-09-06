@@ -413,6 +413,7 @@ def run_python_tests(args: argparse.Namespace, root: Path, env: dict[str, str]) 
         root / "tools" / "tests" / "cmdargs_append_contract.py",
         root / "tools" / "tests" / "competitive_match_layer.py",
         root / "tools" / "tests" / "competitive_match_localization.py",
+        root / "tools" / "tests" / "coop_game_type_routing.py",
         root / "tools" / "tests" / "decl_checksum_stability_contract.py",
         root / "tools" / "tests" / "match_control_localization_bridge.py",
         root / "tools" / "tests" / "match_control_ui_contract.py",

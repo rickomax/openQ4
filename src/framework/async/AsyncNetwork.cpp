@@ -31,6 +31,7 @@ If you have questions concerning this license or the applicable additional terms
 
 #include "AsyncNetwork.h"
 #include "../ArenaCampaign.h"
+#include "../CoopGameType.h"
 
 idAsyncServer		idAsyncNetwork::server;
 idAsyncClient		idAsyncNetwork::client;
@@ -463,6 +464,19 @@ void idAsyncNetwork::SetCheatsEnabled( bool enabled ) {
 
 /*
 ==================
+Net_RequiredGameModule
+
+Which game module has to be loaded before this host can spawn a server or
+connect to one. Co-op runs campaign maps, so it needs game_sp; every other
+networked mode needs game_mp.
+==================
+*/
+static const char *Net_RequiredGameModule( void ) {
+	return idCoopGameType::IsCoopGameTypeActive() ? idCoopGameType::GAME_MODULE_NAME : "game_mp";
+}
+
+/*
+==================
 idAsyncNetwork::SpawnServer_f
 ==================
 */
@@ -481,14 +495,17 @@ void idAsyncNetwork::SpawnServer_f( const idCmdArgs &args ) {
 		return;
 	}
 
-	// don't let a server spawn with singleplayer game type - it will crash
+	// don't let a server spawn with singleplayer game type - it will crash.
+	// Co-op is the supported way to network campaign content and carries its own
+	// si_gameType, so it is not rewritten here.
 	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
 		cvarSystem->SetCVarString( "si_gameType", "DM" );
 	}
 
+	const char *requiredModule = Net_RequiredGameModule();
 	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
-	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
-		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+	if ( idStr::Icmp( activeModule, requiredModule ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", requiredModule );
 		idCmdArgs reloadArgs;
 		reloadArgs.AppendArg( "spawnServer" );
 		if ( args.Argc() > 1 ) {
@@ -577,14 +594,17 @@ void idAsyncNetwork::Connect_f( const idCmdArgs &args ) {
 	}
 	// Select a deterministic provisional mode before any required game-module
 	// reload. LoadGameDLL repeats this guard after archived config replay so the
-	// client and server agree before serverInfo arrives.
+	// client and server agree before serverInfo arrives. A client joining a co-op
+	// server has to carry si_gameType Coop into the connect, because the server's
+	// serverInfo does not arrive until after the module is chosen.
 	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
 		cvarSystem->SetCVarString( "si_gameType", "DM" );
 	}
 
+	const char *requiredModule = Net_RequiredGameModule();
 	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
-	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
-		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+	if ( idStr::Icmp( activeModule, requiredModule ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", requiredModule );
 		idCmdArgs reloadArgs;
 		reloadArgs.AppendArg( "connect" );
 		// One argument, so the replayed command survives re-tokenization.
@@ -606,9 +626,10 @@ void idAsyncNetwork::Reconnect_f( const idCmdArgs &args ) {
 	if ( idStr::Icmp( cvarSystem->GetCVarString( "si_gameType" ), "singleplayer" ) == 0 ) {
 		cvarSystem->SetCVarString( "si_gameType", "DM" );
 	}
+	const char *requiredModule = Net_RequiredGameModule();
 	const char *activeModule = cvarSystem->GetCVarString( "com_activeGameModule" );
-	if ( idStr::Icmp( activeModule, "game_mp" ) != 0 ) {
-		cvarSystem->SetCVarString( "com_nextGameModule", "game_mp" );
+	if ( idStr::Icmp( activeModule, requiredModule ) != 0 ) {
+		cvarSystem->SetCVarString( "com_nextGameModule", requiredModule );
 		idCmdArgs reloadArgs;
 		reloadArgs.AppendArg( "reconnect" );
 		cmdSystem->SetupReloadGameModule( reloadArgs );

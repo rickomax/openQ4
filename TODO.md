@@ -17,6 +17,7 @@ This file tracks current known issues and upcoming features.
 - [ ] Merge shared code between MP/SP and streamline the process of switching between each.
 - [ ] Find and implement ways to improve loading times.
 - [ ] Expand multiplayer controls and port relevant WORR functionality/logic.
+- [ ] Co-operative campaign play — foundation landed (co-op `si_gameType` keeps `game_sp` loaded for listen, dedicated and joining clients; campaign spawn spots; server-authoritative AI replication). Remaining work — scripted sequences, cinematics, level transitions, respawn model, vehicles, checkpoint saves and menu/browser entry — is tracked in [docs/dev/plans/2026-09-06-cooperative-campaign-play.md](docs/dev/plans/2026-09-06-cooperative-campaign-play.md).
 - [ ] Improve menu and loading screen horizontal expansion behavior.
 - [ ] Machinegun and railgun zoom images need to suit all screen aspect ratios.
 - [ ] CPMA-esque rainbow a-z color escapes implementation, disable black

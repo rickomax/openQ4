@@ -32,6 +32,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "Session_local.h"
 #include "ArenaCampaign.h"
 #include "BuildVersion.h"
+#include "CoopGameType.h"
 #include "../sys/NetworkEndpoint.h"
 #if defined( __has_include )
 #if __has_include( "openq4_savegame_compat_generated.h" )
@@ -5359,6 +5360,10 @@ void idSessionLocal::LoadLoadingGui( const char *mapName ) {
 	const char *spawnEntityFilter = mapSpawnData.serverInfo.GetString( "si_entityFilter", "" );
 	const bool mapLooksMultiplayer = !idStr::Icmpn( spawnMapPath, "mp/", 3 );
 	const bool isMultiplayerLoad = mapLooksMultiplayer || ( spawnGameType[ 0 ] != '\0' && idStr::Icmp( spawnGameType, "singleplayer" ) != 0 );
+	// Co-op is a networked load, so it still wants the server name, address and
+	// gametype on screen, but it loads campaign maps that carry objectives. Let
+	// it fall through to the single-player loadscreen rather than mplevel.gui.
+	const bool isCoopLoad = idCoopGameType::IsCoopGameTypeName( spawnGameType );
 
 	idDict mapDeclDict;
 	const idDict *mapDef = Session_GetMapDeclDict( spawnMapPath, spawnEntityFilter, mapDeclDict ) ? &mapDeclDict : NULL;
@@ -5408,7 +5413,7 @@ void idSessionLocal::LoadLoadingGui( const char *mapName ) {
 		guiLoading = uiManager->FindGui( loadGuiOverride, true, false, true );
 	} else if ( uiManager->CheckGui( guiMap ) ) {
 		guiLoading = uiManager->FindGui( guiMap, true, false, true );
-	} else if ( isMultiplayerLoad && uiManager->CheckGui( "guis/loading/mplevel.gui" ) ) {
+	} else if ( isMultiplayerLoad && !isCoopLoad && uiManager->CheckGui( "guis/loading/mplevel.gui" ) ) {
 		guiLoading = uiManager->FindGui( "guis/loading/mplevel.gui", true, false, true );
 	} else if ( loadingObjectives[0] && uiManager->CheckGui( "guis/loading/splevel.gui" ) ) {
 		guiLoading = uiManager->FindGui( "guis/loading/splevel.gui", true, false, true );

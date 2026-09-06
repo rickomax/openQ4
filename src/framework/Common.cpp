@@ -35,6 +35,7 @@ If you have questions concerning this license or the applicable additional terms
 #include "../render_geo/RenderGeometry.h"
 #include "../renderer/RendererModule.h"
 #include "ArenaCampaign.h"
+#include "CoopGameType.h"
 #include "GameModuleDiagnostics.h"
 #include "RenderDoc.h"
 #include "ParallelJobSystem.h"
@@ -6117,6 +6118,15 @@ static const char *openQ4_SelectGameModuleBaseName( void ) {
 	}
 
 	const char *gameType = cvarSystem->GetCVarString( "si_gameType" );
+
+	// Co-op seats real clients but plays campaign content, so it is the one
+	// networked mode that stays on game_sp. This is checked ahead of both
+	// readings below, including the dedicated one: a co-op dedicated server is
+	// exactly the case the "anything but singleplayer" rule would misroute.
+	if ( idCoopGameType::IsCoopGameTypeName( gameType ) ) {
+		return idCoopGameType::GAME_MODULE_NAME;
+	}
+
 #ifdef ID_DEDICATED
 	// A dedicated server has no single-player mode at all (StartNewGame refuses
 	// there), so keep the historical "anything but singleplayer" reading rather
