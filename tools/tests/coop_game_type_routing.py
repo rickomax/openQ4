@@ -455,6 +455,151 @@ def validate_boss_bar_replication() -> None:
             raise AssertionError(f"{signature} still addresses the local player only")
 
 
+def validate_influence_replication() -> None:
+    game_local_h = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.h")
+    for token in (
+        "COOP_CAMPAIGN_EVENT_INFLUENCE,",
+        "COOP_CAMPAIGN_EVENT_INFLUENCE_FOV,",
+        "COOP_CAMPAIGN_EVENT_INFLUENCE_SOUND,",
+        "COOP_CAMPAIGN_PAYLOAD_INFLUENCE,",
+        "COOP_CAMPAIGN_PAYLOAD_INTERPOLATE,",
+        "coopInfluenceState_t",
+        "bool					setVision;",
+    ):
+        require(game_local_h, token, "influence campaign vocabulary")
+
+    # Existing ordinals must not move.
+    if game_local_h.index("COOP_CAMPAIGN_EVENT_BOSS_MAX_HEALTH") > game_local_h.index("COOP_CAMPAIGN_EVENT_INFLUENCE,"):
+        raise AssertionError("influence events must be appended after the existing campaign events")
+    if game_local_h.index("COOP_CAMPAIGN_PAYLOAD_ENTITY,") > game_local_h.index("COOP_CAMPAIGN_PAYLOAD_INFLUENCE,"):
+        raise AssertionError("influence payload shapes must be appended after the existing ones")
+
+    game_local = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.cpp")
+    for signature, applier in (
+        ("void idGameLocal::SendCoopCampaignInfluence( const coopInfluenceState_t &state )",
+         "ApplyCoopCampaignInfluence( state );"),
+        ("void idGameLocal::SendCoopCampaignInfluenceFov( int startTime, int duration, float startValue, float endValue, bool leaveOnDone )",
+         "ApplyCoopCampaignInfluenceFov( startTime, duration, startValue, endValue, leaveOnDone );"),
+    ):
+        body = function_body(game_local, signature, "influence send path")
+        require(body, "if ( isClient ) {", "influence send path")
+        require(body, 'networkSystem->ServerSendReliableMessage( -1, outMsg );', "influence send path")
+        if body.count(applier) != 1:
+            raise AssertionError(f"{applier!r} must be applied exactly once in the send path")
+
+    # An influence with no vision effect must leave the current one alone, which
+    # is what idTarget_SetInfluence did by simply not calling SetInfluenceView.
+    apply_influence = function_body(
+        game_local,
+        "void idGameLocal::ApplyCoopCampaignInfluence( const coopInfluenceState_t &state )",
+        "influence application",
+    )
+    require(apply_influence, "if ( !state.setVision ) {", "influence application")
+    require(apply_influence, "player->SetInfluenceLevel( state.level );", "influence application")
+
+    # Field order must agree between writer and reader.
+    send_influence = function_body(
+        game_local,
+        "void idGameLocal::SendCoopCampaignInfluence( const coopInfluenceState_t &state )",
+        "influence write",
+    )
+    network = read(GAME_LIBS_ROOT / "src" / "game" / "Game_network.cpp")
+    client_read = function_body(
+        network,
+        "void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &msg )",
+        "influence read",
+    )
+    influence_case_start = client_read.index("case COOP_CAMPAIGN_PAYLOAD_INFLUENCE:")
+    influence_case = client_read[influence_case_start : client_read.index("case ", influence_case_start + 1)]
+    written = [
+        "outMsg.WriteLong( state.level );",
+        "outMsg.WriteBits( state.setVision ? 1 : 0, 1 );",
+        "outMsg.WriteString( state.visionMaterial.c_str() );",
+        "outMsg.WriteString( state.visionSkin.c_str() );",
+        "outMsg.WriteFloat( state.visionRadius );",
+        "outMsg.WriteLong( state.visionEntitySpawnId );",
+    ]
+    positions = [send_influence.index(token) for token in written]
+    if positions != sorted(positions):
+        raise AssertionError("influence fields are not written in the documented order")
+    read_order = [
+        "influence.level = msg.ReadLong();",
+        "influence.setVision = msg.ReadBits( 1 ) != 0;",
+        "influence.visionRadius = msg.ReadFloat();",
+        "influence.visionEntitySpawnId = msg.ReadLong();",
+    ]
+    positions = [influence_case.index(token) for token in read_order]
+    if positions != sorted(positions):
+        raise AssertionError("influence fields are not read in the order they are written")
+
+    interpolate_start = client_read.index("case COOP_CAMPAIGN_PAYLOAD_INTERPOLATE:")
+    interpolate_case = client_read[interpolate_start : client_read.index("case ", interpolate_start + 1)]
+    for token in (
+        "const int startTime = msg.ReadLong();",
+        "const int duration = msg.ReadLong();",
+        "const float startValue = msg.ReadFloat();",
+        "const float endValue = msg.ReadFloat();",
+        "const bool leaveOnDone = msg.ReadBits( 1 ) != 0;",
+    ):
+        require(interpolate_case, token, "influence fov read")
+
+    # The fov arrives as a curve because neither target's Think runs on a
+    # client, so the player has to evaluate it on both per-frame paths.
+    player_h = read(GAME_LIBS_ROOT / "src" / "game" / "Player.h")
+    for token in (
+        "void					SetCoopInfluenceFov			( int startTime, int duration, float startValue, float endValue, bool leaveOnDone );",
+        "void					UpdateCoopInfluenceFov		( void );",
+        "idInterpolate<float>	coopInfluenceFov;",
+    ):
+        require(player_h, token, "player-side influence fov curve")
+
+    player = read(GAME_LIBS_ROOT / "src" / "game" / "Player.cpp")
+    for signature, context in (
+        ("void idPlayer::Think( void )", "server and single-player frame"),
+        ("void idPlayer::LocalClientPredictionThink( void )", "client frame"),
+    ):
+        body = function_body(player, signature, context)
+        require(body, "UpdateCoopInfluenceFov();", f"influence fov advanced on the {context}")
+
+    update_fov = function_body(player, "void idPlayer::UpdateCoopInfluenceFov ( void )", "influence fov evaluation")
+    require(update_fov, "SetInfluenceFov( coopInfluenceFov.GetCurrentValue( gameLocal.time ) );", "influence fov evaluation")
+    require(update_fov, "coopInfluenceFovActive = false;", "influence fov evaluation")
+
+    # Neither target may drive the local player's fov in co-op, and neither may
+    # dereference a local player that a dedicated server does not have.
+    target = read(GAME_LIBS_ROOT / "src" / "game" / "Target.cpp")
+    for signature, context in (
+        ("void idTarget_SetFov::Event_Activate( idEntity *activator )", "set fov activate"),
+        ("void idTarget_SetInfluence::Event_Activate( idEntity *activator )", "influence activate"),
+    ):
+        body = function_body(target, signature, context)
+        require(body, "gameLocal.SendCoopCampaignInfluenceFov(", context)
+
+    for signature, context in (
+        ("void idTarget_SetFov::Think( void )", "set fov think"),
+        ("void idTarget_SetInfluence::Think( void )", "influence think"),
+    ):
+        body = function_body(target, signature, context)
+        require(body, "if ( !player ) {", f"{context} null-player guard")
+
+    for signature, context in (
+        ("void idTarget_SetInfluence::Event_Flash( float flash, int out )", "influence flash"),
+        ("void idTarget_SetInfluence::Event_ClearFlash( float flash )", "influence flash clear"),
+    ):
+        body = function_body(target, signature, context)
+        require(body, "gameLocal.SendCoopCampaignFade(", context)
+        if "GetLocalPlayer()" in body:
+            raise AssertionError(f"{context} still addresses the local player only")
+
+    restore = function_body(
+        target,
+        "void idTarget_SetInfluence::Event_RestoreInfluence()",
+        "influence restore",
+    )
+    require(restore, "gameLocal.SendCoopCampaignInfluence( influence );", "influence restore")
+    require(restore, "influence.setVision = true;", "influence restore clears the vision")
+
+
 def main() -> int:
     if not GAME_LIBS_ROOT.is_dir():
         print(
@@ -472,6 +617,7 @@ def main() -> int:
     validate_ai_replication()
     validate_campaign_script_replication()
     validate_boss_bar_replication()
+    validate_influence_replication()
     print("coop_game_type_routing: ok")
     return 0
 

@@ -1,7 +1,7 @@
 # Co-operative Campaign Play Plan
 
 Date: 2026-09-06
-Status: Phase 1 (routing, session, campaign-AI replication), Phase 2a (campaign script replication) and Phase 2b (boss bars) in place; not yet playable end to end
+Status: Phase 1 (routing, session, campaign-AI replication) and Phase 2 (campaign script replication, boss bars, influences and fov) in place; not yet playable end to end
 
 ## Why this needs a plan at all
 
@@ -163,16 +163,55 @@ The shield bar, shield warning bar, shield fill and health-bar scale are
 script-authored numbers with no entity behind them, so they travel as plain
 floats.
 
-## Phase 2c and beyond: what is not done
+## Phase 2c: influences and field of view
 
-Still open, roughly in dependency order:
+`idTarget_SetInfluence` is the largest of the script-to-player targets. Most of
+what it does is world state - relighting, skins, sounds, guis - which already
+replicates because those entities do. What did not travel is the half that
+lives on the player: influence level, the fullscreen vision material and skin,
+a forced facing, the white flash and its sound, and the field of view.
+`idTarget_SetFov` is the same fov mechanism on its own.
 
-- **Remaining script-to-player effects.** `idTarget_SetInfluence` and
-  `idTarget_SetFov` still address the local player only.
+Both were also unsafe. `idTarget_SetFov::Think`, `idTarget_SetInfluence::Think`,
+`Event_Flash`, `Event_ClearFlash` and `Event_RestoreInfluence` all dereferenced
+`gameLocal.GetLocalPlayer()` without checking - the `Think` cases every frame
+while active - which is a crash on a dedicated co-op server.
+
+The fov is a **curve, not a value**. Both targets drive it a frame at a time
+from their own `Think`, and neither target is replicated, so on a client that
+`Think` never runs. Sending a value per frame over the reliable channel would
+be both wasteful and wrong. Instead the curve - start time, duration, start and
+end value, and whether to clear when it finishes - is sent once, and each
+player evaluates it in `idPlayer::UpdateCoopInfluenceFov`. That has to be
+driven from two places, because a client's own player never reaches
+`idPlayer::Think`: the server and single-player path calls it there, the client
+path from `LocalClientPredictionThink`. Outside co-op the original `Think`
+still drives the fov, so single-player behaviour is untouched; in co-op neither
+target activates `TH_THINK` at all and every player, host included, evaluates
+its own copy. This is the same shape as the boss health bar - send the driver,
+not the samples.
+
+The rest of the influence travels as one message rather than several, because
+`idTarget_SetInfluence` always sets and clears those pieces together and a
+receiver that applied half of it would be left in a state no script asked for.
+One detail is easy to get wrong: an influence that does not ask for a vision
+effect must leave whatever is on screen alone, which the original achieved by
+simply not calling `SetInfluenceView`. The message carries an explicit
+`setVision` flag so "do not touch it" and "clear it" stay distinguishable -
+clearing an influence is the same message with `setVision` set and no material.
+
+The flash reuses the existing fade event, and its sound travels as a string.
+
+## Phase 3 and beyond: what is not done
+
+Still open:
+
 - **Script and thread state.** Scripts run server-side and their effects
   replicate, but `idThread` state itself does not. A client that joins
   mid-sequence sees the world as the snapshot describes it, not the sequence
   from its start.
+- **Cinematics, level transitions, respawn, vehicles, checkpoint saves.** As
+  listed under Phase 1; none of these have been started.
 - **Cinematics.** `inCinematic` gates player control and camera. Co-op needs a
   policy for players who are not the cinematic's subject.
 - **Level transitions.** Campaign maps chain through `EndLevel`; co-op needs all
@@ -221,5 +260,12 @@ rather than inserted, that the boss identity is sent as a packed spawn id, that
 `StartBossBattle` clears the held id (or resolution would retry forever), that
 resolution is retried where the bar is maintained rather than attempted once,
 and that none of the five boss target events still address the local player.
+
+For Phase 2c it pins that the influence events and payload shapes are appended
+rather than inserted, that the influence fields are written and read in the same
+order, that `setVision` survives so "leave the vision alone" stays distinct from
+"clear it", that the fov curve is advanced on both the server and client
+per-frame paths, and that neither target still drives or dereferences the local
+player.
 
 It skips cleanly when no `openQ4-game` checkout is present.
