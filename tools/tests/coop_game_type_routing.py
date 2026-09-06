@@ -301,7 +301,10 @@ def validate_campaign_script_replication() -> None:
         "case COOP_CAMPAIGN_PAYLOAD_STRINGS:"
     ):
         raise AssertionError("co-op campaign payload shape must be read before the payload")
-    if send_fade.count("outMsg.WriteFloat(") != 4 or client_read.count("msg.ReadFloat();") != 4:
+    # Scope the count to the fade case: other payload shapes read floats too.
+    fade_case_start = client_read.index("case COOP_CAMPAIGN_PAYLOAD_FADE:")
+    fade_case = client_read[fade_case_start : client_read.index("case ", fade_case_start + 1)]
+    if send_fade.count("outMsg.WriteFloat(") != 4 or fade_case.count("msg.ReadFloat();") != 4:
         raise AssertionError("co-op campaign fade colour must be four floats on both sides")
     require(send_fade, "outMsg.WriteLong( fadeTime );", "co-op campaign fade write")
     require(client_read, "const int fadeTime = msg.ReadLong();", "co-op campaign fade read")
@@ -357,6 +360,101 @@ def validate_campaign_script_replication() -> None:
         require(body, event, "campaign HUD effect")
 
 
+def validate_boss_bar_replication() -> None:
+    game_local_h = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.h")
+    for token in (
+        "COOP_CAMPAIGN_EVENT_BOSS_START",
+        "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_BAR",
+        "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_WARN_BAR",
+        "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_PERCENT",
+        "COOP_CAMPAIGN_EVENT_BOSS_MAX_HEALTH",
+        "COOP_CAMPAIGN_PAYLOAD_FLOAT",
+        "COOP_CAMPAIGN_PAYLOAD_ENTITY",
+    ):
+        require(game_local_h, token, "boss bar campaign vocabulary")
+
+    # Existing event ordinals must not move.
+    if game_local_h.index("COOP_CAMPAIGN_EVENT_FADE") > game_local_h.index("COOP_CAMPAIGN_EVENT_BOSS_START"):
+        raise AssertionError("boss events must be appended after the existing campaign events")
+    if game_local_h.index("COOP_CAMPAIGN_PAYLOAD_FADE") > game_local_h.index("COOP_CAMPAIGN_PAYLOAD_FLOAT"):
+        raise AssertionError("boss payload shapes must be appended after the existing ones")
+
+    game_local = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.cpp")
+    for signature, applier in (
+        ("void idGameLocal::SendCoopCampaignFloat( int eventType, float value )",
+         "ApplyCoopCampaignFloat( eventType, value );"),
+        ("void idGameLocal::SendCoopCampaignEntity( int eventType, const idEntity *ent )",
+         "ApplyCoopCampaignEntity( eventType, entitySpawnId );"),
+    ):
+        body = function_body(game_local, signature, "boss bar send path")
+        require(body, "if ( isClient ) {", "boss bar send path")
+        require(body, 'networkSystem->ServerSendReliableMessage( -1, outMsg );', "boss bar send path")
+        if body.count(applier) != 1:
+            raise AssertionError(f"{applier!r} must be applied exactly once in the send path")
+
+    # An entity reference has to carry its spawn id, or a client resolves it to
+    # whatever later entity reused the number.
+    send_entity = function_body(
+        game_local,
+        "void idGameLocal::SendCoopCampaignEntity( int eventType, const idEntity *ent )",
+        "boss identity write",
+    )
+    require(send_entity, "PackEntitySpawnId( spawnIds[ ent->entityNumber ], ent->entityNumber )", "boss identity write")
+
+    network = read(GAME_LIBS_ROOT / "src" / "game" / "Game_network.cpp")
+    client_read = function_body(
+        network,
+        "void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &msg )",
+        "boss bar read",
+    )
+    for token in (
+        "case COOP_CAMPAIGN_PAYLOAD_FLOAT:",
+        "case COOP_CAMPAIGN_PAYLOAD_ENTITY:",
+        "const int entitySpawnId = msg.ReadLong();",
+    ):
+        require(client_read, token, "boss bar read")
+
+    # The reliable message can outrun the snapshot that spawns the boss, so the
+    # reference is held rather than resolved once and dropped.
+    player_h = read(GAME_LIBS_ROOT / "src" / "game" / "Player.h")
+    for token in (
+        "void					SetBossBattleTarget			( int entitySpawnId );",
+        "void					ResolvePendingBossBattle	( void );",
+        "int						pendingBossSpawnId;",
+    ):
+        require(player_h, token, "held boss battle reference")
+
+    player = read(GAME_LIBS_ROOT / "src" / "game" / "Player.cpp")
+    resolve = function_body(player, "void idPlayer::ResolvePendingBossBattle ( void )", "boss resolution")
+    require(resolve, "gameLocal.spawnIds[ entityNum ] != ( pendingBossSpawnId >> GENTITYNUM_BITS )", "boss resolution")
+    require(resolve, "StartBossBattle( enemy );", "boss resolution")
+
+    # StartBossBattle has to clear the held id, or resolution retries forever.
+    start = function_body(player, "void idPlayer::StartBossBattle ( idEntity* enemy )", "boss battle start")
+    require(start, "pendingBossSpawnId = 0;", "boss battle start")
+
+    # Resolution has to be retried, not attempted once.
+    hud_stats = function_body(player, "void idPlayer::UpdateHudStats( idUserInterface *_hud )", "boss bar maintenance")
+    require(hud_stats, "ResolvePendingBossBattle();", "boss bar maintenance")
+
+    # All four boss target events reached the local player only, three of them
+    # through an unchecked GetLocalPlayer()->GetHud().
+    target = read(GAME_LIBS_ROOT / "src" / "game" / "Target.cpp")
+    for signature, event in (
+        ("void rvTarget_BossBattle::Event_Activate( idEntity *activator )", "COOP_CAMPAIGN_EVENT_BOSS_START"),
+        ("void rvTarget_BossBattle::Event_AllowShieldBar( float activate )", "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_BAR"),
+        ("void rvTarget_BossBattle::Event_AllowShieldWarningBar( float activate )",
+         "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_WARN_BAR"),
+        ("void rvTarget_BossBattle::Event_SetShieldPercent( float percent )",
+         "COOP_CAMPAIGN_EVENT_BOSS_SHIELD_PERCENT"),
+        ("void rvTarget_BossBattle::Event_SetBossMaxHealth( float f )", "COOP_CAMPAIGN_EVENT_BOSS_MAX_HEALTH"),
+    ):
+        body = function_body(target, signature, "boss bar target")
+        require(body, event, "boss bar target")
+        if "GetLocalPlayer()" in body:
+            raise AssertionError(f"{signature} still addresses the local player only")
+
+
 def main() -> int:
     if not GAME_LIBS_ROOT.is_dir():
         print(
@@ -373,6 +471,7 @@ def main() -> int:
     validate_campaign_spawns()
     validate_ai_replication()
     validate_campaign_script_replication()
+    validate_boss_bar_replication()
     print("coop_game_type_routing: ok")
     return 0
 

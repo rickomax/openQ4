@@ -1,7 +1,7 @@
 # Co-operative Campaign Play Plan
 
 Date: 2026-09-06
-Status: Phase 1 (routing, session, campaign-AI replication) and Phase 2a (campaign script replication) in place; not yet playable end to end
+Status: Phase 1 (routing, session, campaign-AI replication), Phase 2a (campaign script replication) and Phase 2b (boss bars) in place; not yet playable end to end
 
 ## Why this needs a plan at all
 
@@ -136,15 +136,39 @@ obvious: `idPlayer::LocalClientPredictionThink` calls
 prediction. General map triggers therefore never fire client-side, and campaign
 scripting cannot double-execute.
 
-## Phase 2b and beyond: what is not done
+## Phase 2b: boss bars
+
+All five `rvTarget_BossBattle` events addressed the local player, three of them
+through an unchecked `gameLocal.GetLocalPlayer()->GetHud()` - the local player
+being the listen host and nobody else, or `NULL` on a dedicated server.
+
+The boss *health* bar needed less than it looks. `idPlayer::UpdateHudStats`
+already recomputes it every frame from `bossEnemy->health`, so a client whose
+own `idPlayer` knows which entity the boss is draws the bar correctly with no
+per-frame traffic at all - it reads the health out of the AI snapshot Phase 1
+already sends. Only the boss's *identity* travels, once, as a packed spawn id so
+a client cannot resolve it to a later entity that reused the number.
+
+That identity can outrun the boss itself. Reliable messages and snapshots are
+separate streams, so `COOP_CAMPAIGN_EVENT_BOSS_START` can arrive before the
+snapshot that spawns the boss on that client. `idPlayer::SetBossBattleTarget`
+holds the id and `ResolvePendingBossBattle` retries each frame from the same
+place the bar is maintained; until it resolves, `bossEnemy` is simply unset and
+the HUD is untouched, so the bar appears when the boss does. The held id is
+deliberately not archived in savegames: it is only ever non-zero for the moment
+between the message and the entity arriving on a co-op client, co-op clients do
+not save, and archiving it would change the savegame format for no gain.
+
+The shield bar, shield warning bar, shield fill and health-bar scale are
+script-authored numbers with no entity behind them, so they travel as plain
+floats.
+
+## Phase 2c and beyond: what is not done
 
 Still open, roughly in dependency order:
 
-- **Remaining script-to-player effects.** `idTarget_SetInfluence`,
-  `idTarget_SetFov` and `rvTarget_BossBattle`'s shield and boss-health bars
-  still address the local player only. They need the same treatment as the
-  effects above; the boss bars in particular are a visible gap in any boss
-  fight.
+- **Remaining script-to-player effects.** `idTarget_SetInfluence` and
+  `idTarget_SetFov` still address the local player only.
 - **Script and thread state.** Scripts run server-side and their effects
   replicate, but `idThread` state itself does not. A client that joins
   mid-sequence sees the world as the snapshot describes it, not the sequence
@@ -191,5 +215,11 @@ that payload shape is read before the event type is judged, that
 that each send path applies its effect locally exactly once, that both
 worldspawn script entry points defer, and that the call sites which used to
 dereference `GetLocalPlayer()` unchecked no longer do.
+
+For Phase 2b it pins that the boss events and payload shapes are appended
+rather than inserted, that the boss identity is sent as a packed spawn id, that
+`StartBossBattle` clears the held id (or resolution would retry forever), that
+resolution is retried where the bar is maintained rather than attempted once,
+and that none of the five boss target events still address the local player.
 
 It skips cleanly when no `openQ4-game` checkout is present.
