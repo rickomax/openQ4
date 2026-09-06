@@ -1,7 +1,7 @@
 # Co-operative Campaign Play Plan
 
 Date: 2026-09-06
-Status: Phase 1 (routing, session and campaign-AI replication foundation) in place; not yet playable end to end
+Status: Phase 1 (routing, session, campaign-AI replication) and Phase 2a (campaign script replication) in place; not yet playable end to end
 
 ## Why this needs a plan at all
 
@@ -83,14 +83,72 @@ briefly-lagged client in phase instead of restarting every animation from frame
 zero, and the index is range-checked against the receiving client's own animator
 before it is played.
 
-## Phase 2 and beyond: what is not done
+## Phase 2a: campaign scripting
 
-Phase 1 is the foundation, not a playable campaign. Still open, roughly in
-dependency order:
+Two things stood between co-op and a campaign script running at all.
 
-- **Scripted sequences.** Campaign progression is script-driven and runs
-  server-side only. Triggers, objectives, door and lift scripting, and
-  `idThread` state need replication or client-side re-derivation.
+**Scripts started before anyone was there to run them against.**
+`idWorldspawn::Spawn` starts a map's `main()` - and any `call` functions on
+worldspawn - with `DelayedStart( 0 )`, on the frame after the map loads. In
+single-player the player entity is spawned moments later by the session, so a
+script that reaches for the player finds one. In co-op the engine does not spawn
+players at map load at all: they arrive through `ServerClientBegin` when they
+connect, and on a dedicated server that may be minutes later or never. Campaign
+scripts open by reaching for the player. `QueueCoopMapScript` holds those
+threads and `StartPendingCoopMapScripts` releases them, once, when the first
+player spawns. `idTarget_Give`'s `onSpawn` loadout has the same problem and
+re-posts itself until somebody is there to receive it.
+
+**Script effects reached one player.** Campaign scripting was written against a
+single player, so target entities and script events reach for
+`GetLocalPlayer()` and act on whatever comes back. In co-op that is the listen
+host and nobody else, and on a dedicated server it is `NULL` - which several of
+those call sites dereferenced without checking, `rvTarget_AmmoStash` and
+`idThread::Event_DrawText` among them.
+
+Which players an effect reaches now depends on what the effect is, and there are
+three answers:
+
+- **Everyone, applied server-side.** `GetCampaignPlayers()` returns the local
+  player alone outside co-op - so single-player behaviour is untouched - and
+  every spawned player in co-op. `idTarget_Give` uses it: a campaign give is
+  progression, not a pickup belonging to whoever walked into it.
+- **Everyone, sent as a message.** Objective text, the secret-area notice, the
+  tip overlay and script-driven screen fades all live in a player's own HUD or
+  `playerView`, which exist only on that player's machine - the server cannot
+  write to them. `GAME_RELIABLE_MESSAGE_COOP_CAMPAIGN_EVENT` carries the effect
+  and each client applies it locally. The send path also applies it locally,
+  because `idAsyncServer::SendReliableMessage` returns early for the local
+  client and a listen host would otherwise be the one player who never sees it.
+- **One player.** `GetCampaignActivator()` returns whoever triggered the effect,
+  falling back to any player present. `rvTarget_AmmoStash` uses it: it spawns
+  ammo into the world sized to one player's needs, so running it per player
+  would spawn duplicates.
+
+The wire format sends the payload *shape* ahead of the payload, so a receiver
+reads the message by shape and only then decides whether it knows the event
+type. An event type added by a newer server is ignored cleanly instead of being
+misread.
+
+Triggers themselves needed no work, which is worth recording because it is not
+obvious: `idPlayer::LocalClientPredictionThink` calls
+`TouchTriggers( &idItem::GetClassType() )`, filtered to items for pickup
+prediction. General map triggers therefore never fire client-side, and campaign
+scripting cannot double-execute.
+
+## Phase 2b and beyond: what is not done
+
+Still open, roughly in dependency order:
+
+- **Remaining script-to-player effects.** `idTarget_SetInfluence`,
+  `idTarget_SetFov` and `rvTarget_BossBattle`'s shield and boss-health bars
+  still address the local player only. They need the same treatment as the
+  effects above; the boss bars in particular are a visible gap in any boss
+  fight.
+- **Script and thread state.** Scripts run server-side and their effects
+  replicate, but `idThread` state itself does not. A client that joins
+  mid-sequence sees the world as the snapshot describes it, not the sequence
+  from its start.
 - **Cinematics.** `inCinematic` gates player control and camera. Co-op needs a
   policy for players who are not the cinematic's subject.
 - **Level transitions.** Campaign maps chain through `EndLevel`; co-op needs all
@@ -124,5 +182,14 @@ co-op branch precedes the dedicated one), the three network command sites, the
 loadscreen choice, the appended `GAME_COOP` ordinal, the `IsMatchGameType`
 exclusions, the campaign spawn paths, and the AI snapshot field ordering -
 write and read must agree, or the delta message desynchronises for every entity
-after it in the snapshot. It skips cleanly when no `openQ4-game` checkout is
-present.
+after it in the snapshot.
+
+For Phase 2a it additionally pins that the reliable message is appended rather
+than inserted, that the campaign fade is four floats and a long on both sides,
+that payload shape is read before the event type is judged, that
+`GetCampaignPlayers` still resolves to exactly the local player outside co-op,
+that each send path applies its effect locally exactly once, that both
+worldspawn script entry points defer, and that the call sites which used to
+dereference `GetLocalPlayer()` unchecked no longer do.
+
+It skips cleanly when no `openQ4-game` checkout is present.

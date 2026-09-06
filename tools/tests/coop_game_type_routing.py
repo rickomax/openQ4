@@ -226,6 +226,137 @@ def validate_ai_replication() -> None:
     require(anim_read, "animNum >= animator.NumAnims()", "actor animation index guard")
 
 
+def validate_campaign_script_replication() -> None:
+    game_local_h = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.h")
+
+    # Appended last, so every existing reliable message keeps its ordinal.
+    require(game_local_h, "GAME_RELIABLE_MESSAGE_COOP_CAMPAIGN_EVENT", "co-op campaign reliable message")
+    if game_local_h.index("GAME_RELIABLE_MESSAGE_COOP_CAMPAIGN_EVENT") < game_local_h.index(
+        "GAME_RELIABLE_MESSAGE_CHEAT_NOCLIP"
+    ):
+        raise AssertionError("GAME_RELIABLE_MESSAGE_COOP_CAMPAIGN_EVENT must be appended after the existing messages")
+
+    for token in (
+        "COOP_CAMPAIGN_EVENT_OBJECTIVE",
+        "COOP_CAMPAIGN_EVENT_SECRET_AREA",
+        "COOP_CAMPAIGN_EVENT_TIP",
+        "COOP_CAMPAIGN_EVENT_TIP_OFF",
+        "COOP_CAMPAIGN_EVENT_FADE",
+        "COOP_CAMPAIGN_PAYLOAD_STRINGS",
+        "COOP_CAMPAIGN_PAYLOAD_FADE",
+    ):
+        require(game_local_h, token, "co-op campaign event vocabulary")
+
+    game_local = read(GAME_LIBS_ROOT / "src" / "game" / "Game_local.cpp")
+    for signature in (
+        "int idGameLocal::GetCampaignPlayers( idPlayer *players[ MAX_CLIENTS ] ) const",
+        "idPlayer *idGameLocal::GetCampaignActivator( idEntity *activator ) const",
+        "void idGameLocal::SendCoopCampaignEvent( int eventType, const char *arg0, const char *arg1 )",
+        "void idGameLocal::SendCoopCampaignFade( const idVec4 &fadeColor, int fadeTime )",
+        "void idGameLocal::QueueCoopMapScript( const function_t *func )",
+        "void idGameLocal::StartPendingCoopMapScripts( void )",
+    ):
+        function_body(game_local, signature, "co-op campaign helpers")
+
+    # Outside co-op GetCampaignPlayers has to resolve to exactly the local
+    # player, or every converted call site changes single-player behaviour.
+    campaign_players = function_body(
+        game_local,
+        "int idGameLocal::GetCampaignPlayers( idPlayer *players[ MAX_CLIENTS ] ) const",
+        "campaign player set",
+    )
+    require(campaign_players, "if ( !IsCoop() ) {", "single-player campaign player set")
+    require(campaign_players, "idPlayer *local = GetLocalPlayer();", "single-player campaign player set")
+
+    # A listen-server host receives none of its own reliable messages, so the
+    # send path has to apply the effect locally too - and exactly once.
+    for signature, applier in (
+        ("void idGameLocal::SendCoopCampaignEvent( int eventType, const char *arg0, const char *arg1 )",
+         "ApplyCoopCampaignEvent( eventType, arg0, arg1 );"),
+        ("void idGameLocal::SendCoopCampaignFade( const idVec4 &fadeColor, int fadeTime )",
+         "ApplyCoopCampaignFade( fadeColor, fadeTime );"),
+    ):
+        body = function_body(game_local, signature, "co-op campaign send path")
+        require(body, "if ( isClient ) {", "co-op campaign send path")
+        require(body, 'networkSystem->ServerSendReliableMessage( -1, outMsg );', "co-op campaign send path")
+        if body.count(applier) != 1:
+            raise AssertionError(f"{applier!r} must be applied exactly once in the send path")
+
+    # Write order and read order must agree field for field.
+    send_fade = function_body(
+        game_local,
+        "void idGameLocal::SendCoopCampaignFade( const idVec4 &fadeColor, int fadeTime )",
+        "co-op campaign fade write",
+    )
+    network = read(GAME_LIBS_ROOT / "src" / "game" / "Game_network.cpp")
+    client_read = function_body(
+        network,
+        "void idGameLocal::ClientProcessReliableMessage( int clientNum, const idBitMsg &msg )",
+        "co-op campaign event read",
+    )
+    require(client_read, "case GAME_RELIABLE_MESSAGE_COOP_CAMPAIGN_EVENT:", "co-op campaign event read")
+    # Payload shape is read before the event type is judged, so an event type a
+    # newer server adds is ignored rather than misread.
+    if client_read.index("const int payloadKind = msg.ReadByte();") > client_read.index(
+        "case COOP_CAMPAIGN_PAYLOAD_STRINGS:"
+    ):
+        raise AssertionError("co-op campaign payload shape must be read before the payload")
+    if send_fade.count("outMsg.WriteFloat(") != 4 or client_read.count("msg.ReadFloat();") != 4:
+        raise AssertionError("co-op campaign fade colour must be four floats on both sides")
+    require(send_fade, "outMsg.WriteLong( fadeTime );", "co-op campaign fade write")
+    require(client_read, "const int fadeTime = msg.ReadLong();", "co-op campaign fade read")
+
+    # Campaign map scripts must not start before a player exists to run them
+    # against - on a dedicated co-op server nobody has even connected.
+    worldspawn = function_body(
+        read(GAME_LIBS_ROOT / "src" / "game" / "WorldSpawn.cpp"),
+        "void idWorldspawn::Spawn( void )",
+        "map script startup",
+    )
+    if worldspawn.count("gameLocal.QueueCoopMapScript( func );") != 2:
+        raise AssertionError("both worldspawn script entry points must defer in co-op")
+
+    spawn_player = function_body(
+        game_local,
+        "void idGameLocal::SpawnPlayer(int clientNum, bool isBot, const char* botName)",
+        "player spawn",
+    )
+    require(spawn_player, "StartPendingCoopMapScripts();", "held map script release")
+
+    # Script-driven screen fades reach every player, not just the host.
+    script_thread = read(GAME_LIBS_ROOT / "src" / "game" / "script" / "Script_Thread.cpp")
+    for name in ("FadeIn", "FadeOut", "FadeTo"):
+        body = function_body(script_thread, f"void idThread::Event_{name}(", f"script {name}")
+        require(body, "gameLocal.SendCoopCampaignFade(", f"script {name}")
+        if "GetLocalPlayer()" in body:
+            raise AssertionError(f"idThread::Event_{name} still fades only the local player")
+
+    # These dereferenced GetLocalPlayer() unchecked, which is NULL on a
+    # dedicated co-op server.
+    for path, signature, context in (
+        (("src", "game", "script", "Script_Thread.cpp"),
+         "void idThread::Event_DrawText(", "script debug text"),
+        (("src", "game", "Target.cpp"),
+         "void rvTarget_AmmoStash::Event_Activate( idEntity *activator )", "ammo stash"),
+    ):
+        body = function_body(read(GAME_LIBS_ROOT.joinpath(*path)), signature, context)
+        if "GetLocalPlayer()->" in body:
+            raise AssertionError(f"{context} still dereferences GetLocalPlayer() unchecked")
+
+    # Campaign progression reaches the whole party.
+    target = read(GAME_LIBS_ROOT / "src" / "game" / "Target.cpp")
+    give = function_body(target, "void idTarget_Give::Event_Activate( idEntity *activator )", "campaign give")
+    require(give, "gameLocal.GetCampaignPlayers( players )", "campaign give")
+    for signature, event in (
+        ("void idTarget_SetPrimaryObjective::Event_Activate( idEntity *activator )", "COOP_CAMPAIGN_EVENT_OBJECTIVE"),
+        ("void rvTarget_SecretArea::Event_Activate( idEntity *activator )", "COOP_CAMPAIGN_EVENT_SECRET_AREA"),
+        ("void idTarget_Tip::Event_Activate( idEntity *activator )", "COOP_CAMPAIGN_EVENT_TIP"),
+        ("void idTarget_Tip::Event_TipOff( void )", "COOP_CAMPAIGN_EVENT_TIP_OFF"),
+    ):
+        body = function_body(target, signature, "campaign HUD effect")
+        require(body, event, "campaign HUD effect")
+
+
 def main() -> int:
     if not GAME_LIBS_ROOT.is_dir():
         print(
@@ -241,6 +372,7 @@ def main() -> int:
     validate_game_module_gametype()
     validate_campaign_spawns()
     validate_ai_replication()
+    validate_campaign_script_replication()
     print("coop_game_type_routing: ok")
     return 0
 
