@@ -4,11 +4,25 @@
 # what CI, packaging, the release pipeline and every supported platform use, and
 # this file follows it rather than leads it.
 #
-# Scope: Linux, SDL3 backend, GL renderer module. Windows and macOS are NOT
-# ported and fail with a clear message rather than silently building something
-# that differs from the meson output - the MSVC flag set, the macOS OpenAL
-# provider policy, notarization and the packaging rules all live in meson.build
-# and none of them are reproduced here.
+# Scope: the SDL3 backend and the GL renderer module on Linux, Windows (MSVC)
+# and macOS (Clang).
+#
+# VERIFICATION STATUS, because it is not uniform and the difference matters:
+#   Linux x64  - built and diffed against the meson build. Same exports, same
+#                hardening, and the game modules come out with identical .text.
+#   Windows    - ported from meson.build flag by flag, NOT built. No MSVC
+#                toolchain was available to the author.
+#   macOS      - ported from meson.build flag by flag, NOT built. No Xcode
+#                toolchain was available to the author.
+#
+# tools/tests/cmake_meson_flag_parity.py pins the three platforms' flag sets
+# against meson.build so the unbuilt ones cannot drift silently, but a passing
+# contract test is not a compile. Treat Windows and macOS here as needing a
+# first real build before they are trusted.
+#
+# Release packaging, notarization, code signing, the macOS OpenAL Soft runtime
+# preparation and the AppImage flow are deliberately NOT reproduced. Those live
+# in meson.build and the release workflow, and remain meson-only.
 #
 # Both builds share the repository's own helper scripts for source discovery and
 # code generation - tools/build/meson_sources.py, tools/build/list_sources.py,
@@ -21,13 +35,38 @@
 #   cmake --build build
 
 cmake_minimum_required(VERSION 3.20)
-project(openQ4 VERSION 0.13.0 LANGUAGES C CXX)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if(APPLE)
+  # The macOS platform layer carries two Objective-C++ / Objective-C sources.
+  project(openQ4 VERSION 0.13.0 LANGUAGES C CXX OBJC OBJCXX)
+else()
+  project(openQ4 VERSION 0.13.0 LANGUAGES C CXX)
+endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set(OPENQ4_LINUX TRUE)
+  set(OPENQ4_HOST_TAG linux)
+elseif(WIN32)
+  set(OPENQ4_WINDOWS TRUE)
+  set(OPENQ4_HOST_TAG windows)
+  if(NOT MSVC)
+    message(FATAL_ERROR "openQ4 Windows builds require MSVC, matching meson.build.")
+  endif()
+elseif(APPLE)
+  set(OPENQ4_DARWIN TRUE)
+  set(OPENQ4_HOST_TAG darwin)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "openQ4 macOS builds require Clang, matching meson.build.")
+  endif()
+else()
   message(FATAL_ERROR
-    "The openQ4 CMake build currently covers Linux only. Use the meson build "
-    "for Windows and macOS: see BUILDING.md. meson remains the canonical build "
-    "on every platform, including Linux.")
+    "Unsupported host for the openQ4 CMake build. Use meson: see BUILDING.md.")
+endif()
+
+if(NOT OPENQ4_LINUX)
+  message(STATUS
+    "openQ4: the ${OPENQ4_HOST_TAG} CMake path is ported from meson.build but "
+    "has not been built by its author. meson remains the verified build here.")
 endif()
 
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
@@ -60,7 +99,7 @@ file(MAKE_DIRECTORY "${GENERATED_DIR}")
 function(openq4_emit_sources out_var emit_kind)
   execute_process(
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/build/meson_sources.py"
-            --host-system linux --platform-backend sdl3 --emit ${emit_kind} ${ARGN}
+            --host-system ${OPENQ4_HOST_TAG} --platform-backend sdl3 --emit ${emit_kind} ${ARGN}
     OUTPUT_VARIABLE _raw RESULT_VARIABLE _rc OUTPUT_STRIP_TRAILING_WHITESPACE
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}")
   if(NOT _rc EQUAL 0)
@@ -96,14 +135,30 @@ function(openq4_list_sources out_var subdir)
   set(${out_var} "${_files}" PARENT_SCOPE)
 endfunction()
 
+if(OPENQ4_LINUX)
+  set(OPENQ4_X11_HELPERS true)
+else()
+  set(OPENQ4_X11_HELPERS false)
+endif()
+
 openq4_emit_sources(ENGINE_CLIENT_SOURCES engine --target-kind client --renderer module
-                    --linux-x11-helpers true --include-game false)
+                    --linux-x11-helpers ${OPENQ4_X11_HELPERS} --include-game false)
 # The Linux dedicated discovery deliberately passes no --renderer: it is a
 # separate headless source set, not the static-renderer shape. Forcing
 # --renderer static here pulled renderer sources in and left the link with 52
-# undefined GLEW symbols.
-openq4_emit_sources(ENGINE_DED_SOURCES engine --target-kind dedicated
-                    --linux-x11-helpers false --include-game false)
+# undefined GLEW symbols. Windows keeps the static renderer minus the GL link,
+# which is the shape --renderer static describes; macOS has no ded target in
+# meson.build and gets none here.
+if(OPENQ4_WINDOWS)
+  openq4_emit_sources(ENGINE_DED_SOURCES engine --target-kind dedicated --renderer static
+                      --linux-x11-helpers false --include-game false)
+elseif(OPENQ4_LINUX)
+  openq4_emit_sources(ENGINE_DED_SOURCES engine --target-kind dedicated
+                      --linux-x11-helpers false --include-game false)
+else()
+  set(ENGINE_DED_SOURCES)
+  set(OPENQ4_BUILD_DEDICATED OFF)
+endif()
 openq4_emit_sources(IMAGETOOLS_SOURCES imagetools)
 openq4_emit_sources(RENDER_GEO_SOURCES render_geo)
 openq4_emit_sources(RENDERER_GL_SOURCES renderer_gl)
@@ -217,8 +272,29 @@ set(SDL_STATIC ON CACHE BOOL "" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "" FORCE)
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/subprojects/SDL3-3.4.10" sdl3 EXCLUDE_FROM_ALL)
 
-pkg_check_modules(OPENAL REQUIRED IMPORTED_TARGET openal)
-pkg_check_modules(X11DEPS REQUIRED IMPORTED_TARGET x11 xext)
+if(OPENQ4_LINUX)
+  pkg_check_modules(OPENAL REQUIRED IMPORTED_TARGET openal)
+  pkg_check_modules(X11DEPS REQUIRED IMPORTED_TARGET x11 xext)
+elseif(OPENQ4_WINDOWS)
+  # OpenAL Soft is expected on the include/library path, as meson resolves it.
+  find_package(OpenAL REQUIRED)
+elseif(OPENQ4_DARWIN)
+  set(OPENQ4_MACOS_OPENAL_PROVIDER "system" CACHE STRING
+      "OpenAL provider: 'system' for the pkg-config OpenAL Soft runtime, "
+      "'apple_framework' for Apple's compile-only compatibility framework")
+  set_property(CACHE OPENQ4_MACOS_OPENAL_PROVIDER PROPERTY STRINGS system apple_framework)
+  if(OPENQ4_MACOS_OPENAL_PROVIDER STREQUAL "system")
+    # meson deliberately keeps this provider pkg-config-only; preparing the
+    # checksum-pinned OpenAL Soft runtime itself stays a meson/release concern.
+    pkg_check_modules(OPENAL REQUIRED IMPORTED_TARGET openal)
+  else()
+    find_library(OPENAL_FRAMEWORK OpenAL REQUIRED)
+  endif()
+  foreach(fw Cocoa OpenGL ApplicationServices)
+    string(TOUPPER "${fw}" _fw_upper)
+    find_library(MACOS_${_fw_upper}_FRAMEWORK ${fw} REQUIRED)
+  endforeach()
+endif()
 
 # ---------------------------------------------------------------------------
 # Shared compile settings
@@ -229,15 +305,59 @@ pkg_check_modules(X11DEPS REQUIRED IMPORTED_TARGET x11 xext)
 # between architectures. -fno-sanitize=vptr keeps the module boundary's
 # -z defs contract satisfiable under UBSan.
 # ---------------------------------------------------------------------------
-set(OPENQ4_COMMON_DEFINES
-  __DOOM_DLL__ USE_OPENAL ID_GL_HARDLINK GLEW_NO_GLU
-  _FILE_OFFSET_BITS=64 _FORTIFY_SOURCE=2 _GLIBCXX_ASSERTIONS=1)
-set(OPENQ4_COMMON_FLAGS
-  -Wall -fpermissive -ffp-contract=off -fno-strict-aliasing
-  -fstack-protector-strong -fno-sanitize=vptr)
-set(OPENQ4_SDL3_DEFINES USE_SDL3=1 OPENQ4_HAVE_X11_HELPERS=1)
+set(OPENQ4_COMMON_DEFINES __DOOM_DLL__ USE_OPENAL GLEW_NO_GLU)
+set(OPENQ4_COMMON_FLAGS)
+set(OPENQ4_SDL3_DEFINES USE_SDL3=1)
 
-set(OPENQ4_LINK_OPTIONS_HARDENING -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+if(OPENQ4_WINDOWS)
+  list(APPEND OPENQ4_COMMON_DEFINES _WINDOWS WIN32)
+  list(APPEND OPENQ4_COMMON_FLAGS
+    # /J - default char to unsigned, which the legacy SDK sources assume.
+    /J /FS /source-charset:windows-1252 /execution-charset:windows-1252
+    /Zc:strictStrings-
+    # Pointer/integer size diagnostics stay errors so Win64 truncations cannot
+    # hide in the legacy sources.
+    /we4302 /we4311 /we4312
+    # Narrowly scoped suppressions for legacy C/C++ constructs.
+    /wd4091 /wd4305 /wd4838 /wd5033 /wd5055)
+  if(CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT CMAKE_SYSTEM_PROCESSOR MATCHES "ARM64|arm64")
+    # meson keeps this narrow gate on the validated MSVC x64 lane: the warning
+    # numbers are not portable to clang-cl even though it takes MSVC arguments.
+    list(APPEND OPENQ4_COMMON_FLAGS /we4101 /we4189 /we4267 /we4324 /we4505)
+  endif()
+else()
+  list(APPEND OPENQ4_COMMON_DEFINES ID_GL_HARDLINK)
+  include(CheckCXXCompilerFlag)
+  # -fpermissive is unconditional in meson: the idTech4-era sources rely on
+  # implicit narrowing and pointer casts modern GCC/Clang reject outright.
+  list(APPEND OPENQ4_COMMON_FLAGS -Wall -fpermissive)
+  foreach(flag -fno-strict-aliasing -ffp-contract=off -fstack-protector-strong -fno-sanitize=vptr)
+    string(MAKE_C_IDENTIFIER "HAVE${flag}" _flag_var)
+    check_cxx_compiler_flag("${flag}" ${_flag_var})
+    if(${_flag_var})
+      list(APPEND OPENQ4_COMMON_FLAGS "${flag}")
+    endif()
+  endforeach()
+  list(APPEND OPENQ4_COMMON_DEFINES _FORTIFY_SOURCE=2)
+endif()
+
+if(OPENQ4_LINUX)
+  list(APPEND OPENQ4_COMMON_DEFINES _FILE_OFFSET_BITS=64 _GLIBCXX_ASSERTIONS=1)
+  list(APPEND OPENQ4_SDL3_DEFINES OPENQ4_HAVE_X11_HELPERS=1)
+elseif(OPENQ4_DARWIN)
+  list(APPEND OPENQ4_COMMON_DEFINES MACOS_X=1)
+  if(OPENQ4_MACOS_OPENAL_PROVIDER STREQUAL "system")
+    list(APPEND OPENQ4_COMMON_DEFINES USE_OPENAL_SOFT_INCLUDES=1)
+  endif()
+endif()
+
+if(OPENQ4_LINUX)
+  set(OPENQ4_LINK_OPTIONS_HARDENING -Wl,-z,relro -Wl,-z,now -Wl,-z,noexecstack)
+elseif(OPENQ4_DARWIN)
+  set(OPENQ4_LINK_OPTIONS_HARDENING -Wl,-pie -Wl,-dead_strip -Wl,-headerpad_max_install_names)
+else()
+  set(OPENQ4_LINK_OPTIONS_HARDENING)
+endif()
 
 set(OPENQ4_INCLUDE_DIRS
   "${GENERATED_DIR}"
@@ -293,27 +413,67 @@ target_compile_definitions(renderer_gl PRIVATE
 # this for free with --start-group/--end-group.
 target_link_libraries(renderer_gl PRIVATE
   openq4_imagetools openq4_render_geo openq4_renderer_idlib openq4_glew
-  SDL3::SDL3-static GL ${CMAKE_DL_LIBS} m)
+  SDL3::SDL3-static)
+if(OPENQ4_LINUX)
+  # Direct GL 1.x entry points link against libGL; everything newer resolves
+  # through GLEW into window services.
+  target_link_libraries(renderer_gl PRIVATE GL ${CMAKE_DL_LIBS} m)
+elseif(OPENQ4_WINDOWS)
+  # GLEW resolves GL procs through wglGetProcAddress here.
+  target_link_libraries(renderer_gl PRIVATE opengl32)
+elseif(OPENQ4_DARWIN)
+  target_link_libraries(renderer_gl PRIVATE "${MACOS_OPENGL_FRAMEWORK}")
+endif()
 # Same hardening as the executables, plus the module's export map: only the
 # renderer module entry points leave the .so, and -z defs catches a module
 # referencing an engine symbol that no longer exists at link time rather than
 # at load time. --allow-shlib-undefined is what lets -z defs coexist with the
 # engine symbols this module resolves from its host at runtime.
-target_link_options(renderer_gl PRIVATE
-  ${OPENQ4_LINK_OPTIONS_HARDENING}
-  -Wl,-z,defs -Wl,--allow-shlib-undefined
-  "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+if(OPENQ4_LINUX)
+  # Same hardening as the executables, plus the module's export map: only the
+  # renderer module entry points leave the .so, and -z defs catches a module
+  # referencing an engine symbol that no longer exists at link time rather than
+  # at load time. --allow-shlib-undefined is what lets -z defs coexist with the
+  # engine symbols this module resolves from its host at runtime.
+  target_link_options(renderer_gl PRIVATE
+    ${OPENQ4_LINK_OPTIONS_HARDENING}
+    -Wl,-z,defs -Wl,--allow-shlib-undefined
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+  set_target_properties(renderer_gl PROPERTIES
+    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+elseif(OPENQ4_WINDOWS)
+  target_link_options(renderer_gl PRIVATE /FIXED:NO /LARGEADDRESSAWARE)
+endif()
+
+# meson keeps hidden visibility on Linux only; the other hosts control their
+# exports through the module definition and export list instead.
+if(OPENQ4_LINUX)
+  set(OPENQ4_RENDERER_VISIBILITY hidden)
+else()
+  set(OPENQ4_RENDERER_VISIBILITY default)
+endif()
+
 set_target_properties(renderer_gl PROPERTIES
   OUTPUT_NAME "renderer-gl_${ARCH_TAG}" PREFIX ""
-  CXX_VISIBILITY_PRESET hidden
-  LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+  CXX_VISIBILITY_PRESET ${OPENQ4_RENDERER_VISIBILITY})
 
 # ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
-set(OPENQ4_LINK_OPTIONS ${OPENQ4_LINK_OPTIONS_HARDENING} -Wl,--no-undefined)
+set(OPENQ4_LINK_OPTIONS ${OPENQ4_LINK_OPTIONS_HARDENING})
+if(OPENQ4_LINUX)
+  list(APPEND OPENQ4_LINK_OPTIONS -Wl,--no-undefined)
+elseif(OPENQ4_WINDOWS)
+  list(APPEND OPENQ4_LINK_OPTIONS /STACK:16777216,16777216)
+endif()
 
-add_executable(openq4_client ${ENGINE_CLIENT_SOURCES})
+set(OPENQ4_CLIENT_SOURCES ${ENGINE_CLIENT_SOURCES})
+if(OPENQ4_WINDOWS)
+  # Version resource, as meson compiles it into the Windows engine targets.
+  list(APPEND OPENQ4_CLIENT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sys/win32/rc/openQ4Version.rc")
+endif()
+
+add_executable(openq4_client ${OPENQ4_CLIENT_SOURCES})
 openq4_apply_common(openq4_client)
 # The module-only client compiles against GLEW declarations but links no GL:
 # renderer-gl carries GLEW and libGL itself.
@@ -321,8 +481,32 @@ target_compile_definitions(openq4_client PRIVATE
   ${OPENQ4_SDL3_DEFINES} OPENQ4_RENDERER_MODULE_ONLY)
 target_link_libraries(openq4_client PRIVATE
   openq4_bse openq4_imagetools openq4_render_geo
-  SDL3::SDL3-static openq4_stb_vorbis PkgConfig::OPENAL PkgConfig::X11DEPS
-  Threads::Threads ${CMAKE_DL_LIBS} m)
+  SDL3::SDL3-static openq4_stb_vorbis Threads::Threads)
+
+if(OPENQ4_LINUX)
+  target_link_libraries(openq4_client PRIVATE
+    PkgConfig::OPENAL PkgConfig::X11DEPS ${CMAKE_DL_LIBS} m)
+elseif(OPENQ4_WINDOWS)
+  target_link_libraries(openq4_client PRIVATE
+    OpenAL::OpenAL Dbghelp bcrypt Iphlpapi Winmm ws2_32 shell32 ole32)
+  # A GUI subsystem executable, matching meson's win_subsystem: 'windows'.
+  set_target_properties(openq4_client PROPERTIES WIN32_EXECUTABLE TRUE)
+elseif(OPENQ4_DARWIN)
+  target_link_libraries(openq4_client PRIVATE
+    "${MACOS_COCOA_FRAMEWORK}" "${MACOS_OPENGL_FRAMEWORK}"
+    "${MACOS_APPLICATIONSERVICES_FRAMEWORK}")
+  if(OPENQ4_MACOS_OPENAL_PROVIDER STREQUAL "system")
+    target_link_libraries(openq4_client PRIVATE PkgConfig::OPENAL)
+    # One installed executable serves all three sanctioned layouts: a direct
+    # run from .install, the copied app executable, and the loose diagnostic
+    # binary kept beside openQ4.app in release packages.
+    set_target_properties(openq4_client PROPERTIES
+      INSTALL_RPATH "@loader_path/Frameworks;@loader_path/../Frameworks;@loader_path/openQ4.app/Contents/Frameworks")
+  else()
+    target_link_libraries(openq4_client PRIVATE "${OPENAL_FRAMEWORK}")
+  endif()
+endif()
+
 target_link_options(openq4_client PRIVATE ${OPENQ4_LINK_OPTIONS})
 set_target_properties(openq4_client PROPERTIES
   OUTPUT_NAME "openQ4-client_${ARCH_TAG}" POSITION_INDEPENDENT_CODE ON)
@@ -332,12 +516,28 @@ if(OPENQ4_BUILD_DEDICATED)
   # The dedicated target drops SDL3 and the X11 helpers: it uses the same
   # compile-time declarations but a separate headless source and link set, so
   # its executable depends on no OpenAL, GL, SDL, Wayland or X11 at runtime.
-  add_executable(openq4_ded ${ENGINE_DED_SOURCES})
+  set(OPENQ4_DED_SOURCES ${ENGINE_DED_SOURCES})
+  if(OPENQ4_WINDOWS)
+    list(APPEND OPENQ4_DED_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/sys/win32/rc/openQ4Version.rc")
+  endif()
+
+  add_executable(openq4_ded ${OPENQ4_DED_SOURCES})
   openq4_apply_common(openq4_ded)
   target_compile_definitions(openq4_ded PRIVATE ID_DEDICATED)
+  if(OPENQ4_WINDOWS)
+    # GLAPI=extern strips the dllimport decoration from GLEW's GL 1.1
+    # declarations so the dedicated GL stub's plain definitions link cleanly.
+    target_compile_definitions(openq4_ded PRIVATE GLAPI=extern)
+  endif()
   target_link_libraries(openq4_ded PRIVATE
     openq4_bse openq4_imagetools openq4_render_geo openq4_stb_vorbis
-    openq4_glew_dedicated Threads::Threads ${CMAKE_DL_LIBS} m)
+    openq4_glew_dedicated Threads::Threads)
+  if(OPENQ4_LINUX)
+    target_link_libraries(openq4_ded PRIVATE ${CMAKE_DL_LIBS} m)
+  elseif(OPENQ4_WINDOWS)
+    target_link_libraries(openq4_ded PRIVATE
+      Dbghelp bcrypt Iphlpapi Winmm ws2_32 shell32 ole32)
+  endif()
   target_link_options(openq4_ded PRIVATE ${OPENQ4_LINK_OPTIONS})
   set_target_properties(openq4_ded PROPERTIES
     OUTPUT_NAME "openQ4-ded_${ARCH_TAG}" POSITION_INDEPENDENT_CODE ON)
