@@ -109,6 +109,28 @@ def validate_engine() -> None:
     for framework in ("Cocoa", "OpenGL", "ApplicationServices"):
         require_both(meson, cmake, framework, "engine macOS frameworks")
 
+    # The native Vulkan module. It is built by default and selected at runtime
+    # by r_renderApi, whose fallback is fail-closed - so a build that quietly
+    # omitted it would turn "r_renderApi vulkan" into a silent fallback to GL
+    # rather than an error. Its defines decide how volk and VMA resolve entry
+    # points, and getting them wrong is a runtime failure, not a build one.
+    for flag in (
+        "OPENQ4_RENDERER_VK_MODULE",
+        "VMA_STATIC_VULKAN_FUNCTIONS=0",
+        "VMA_DYNAMIC_VULKAN_FUNCTIONS=1",
+        "VK_ENABLE_BETA_EXTENSIONS",
+        "VK_USE_PLATFORM_WIN32_KHR",
+        "macos_renderer_module.exp",
+    ):
+        require_both(meson, cmake, flag, "Vulkan renderer module")
+
+    # The Vulkan module links the hook-resolving GLEW flavour, not the GL one:
+    # its mixed front-end translation units still have GL call sites.
+    if "glew_dedicated" not in meson:
+        raise AssertionError("meson no longer builds the hook-resolving GLEW flavour")
+    if "openq4_glew_dedicated" not in cmake:
+        raise AssertionError("CMake no longer builds the hook-resolving GLEW flavour")
+
     # GLEW's two flavours. The dedicated one resolves through openQ4's own hook
     # so a GL-free target still links; GLAPI=extern strips the dllimport
     # decoration its stubs would otherwise collide with. meson defines the hook

@@ -4,12 +4,15 @@
 # what CI, packaging, the release pipeline and every supported platform use, and
 # this file follows it rather than leads it.
 #
-# Scope: the SDL3 backend and the GL renderer module on Linux, Windows (MSVC)
-# and macOS (Clang).
+# Scope: the SDL3 backend and both renderer modules - GL and native Vulkan - on
+# Linux, Windows (MSVC) and macOS (Clang). GL is the default renderer;
+# renderer-vk is built by default and stays opt-in behind r_renderApi vulkan,
+# exactly as meson does it.
 #
 # VERIFICATION STATUS, because it is not uniform and the difference matters:
-#   Linux x64  - built and diffed against the meson build. Same exports, same
-#                hardening, and the game modules come out with identical .text.
+#   Linux x64  - built and diffed against the meson build. Both renderer
+#                modules export only GetRenderAPI with the same hardening, and
+#                the game modules come out with identical .text.
 #   Windows    - ported from meson.build flag by flag, NOT built. No MSVC
 #                toolchain was available to the author.
 #   macOS      - ported from meson.build flag by flag, NOT built. No Xcode
@@ -76,6 +79,11 @@ find_package(Threads REQUIRED)
 set(OPENQ4_GAMELIBS_REPO "${CMAKE_CURRENT_SOURCE_DIR}/../openQ4-game" CACHE PATH
     "Companion openQ4-game checkout")
 option(OPENQ4_BUILD_DEDICATED "Build the dedicated server executable" ON)
+# Built and shipped by default, matching meson's build_renderer_vk. It stays
+# opt-in at runtime behind r_renderApi vulkan, with OpenGL as the default and
+# the fail-closed fallback; leaving it out of the build would silently turn that
+# opt-in into a fallback to GL.
+option(OPENQ4_BUILD_RENDERER_VK "Build the native Vulkan renderer module" ON)
 option(OPENQ4_BUILD_GAMES "Build the game modules from the companion repository" ON)
 
 get_filename_component(OPENQ4_GAMELIBS_REPO "${OPENQ4_GAMELIBS_REPO}" ABSOLUTE)
@@ -162,6 +170,11 @@ endif()
 openq4_emit_sources(IMAGETOOLS_SOURCES imagetools)
 openq4_emit_sources(RENDER_GEO_SOURCES render_geo)
 openq4_emit_sources(RENDERER_GL_SOURCES renderer_gl)
+if(OPENQ4_BUILD_RENDERER_VK)
+  # The Vulkan emit takes no host or backend arguments in meson either.
+  openq4_emit_sources(RENDERER_VK_SOURCES renderer_vk)
+  list(APPEND RENDERER_VK_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/external/volk/volk.c")
+endif()
 openq4_list_sources(BSE_SOURCES src/bse)
 openq4_list_sources(IDLIB_SOURCES src/idlib src/idlib/math/Simd_AltiVec.cpp)
 
@@ -458,6 +471,89 @@ set_target_properties(renderer_gl PROPERTIES
   CXX_VISIBILITY_PRESET ${OPENQ4_RENDERER_VISIBILITY})
 
 # ---------------------------------------------------------------------------
+# Vulkan renderer module
+#
+# The shared renderer front-end with the GL backend replaced by the Vulkan one.
+# It links no GL and no SDL: the mixed front-end translation units keep their GL
+# call sites satisfied by the hook-resolving GLEW flavour - the same archive the
+# dedicated server uses - plus the module's own GL stub TU.
+#
+# Built by default because meson builds it by default. r_renderApi decides at
+# runtime whether it is ever loaded, and its absence would not fail loudly: the
+# selection is fail-closed, so a user asking for vulkan would silently get GL.
+# ---------------------------------------------------------------------------
+if(OPENQ4_BUILD_RENDERER_VK)
+  if(OPENQ4_DARWIN)
+    # SHARED, not MODULE. A MODULE on Darwin is an MH_BUNDLE with -undefined
+    # dynamic_lookup, which drops the undefined-symbol closure the other hosts
+    # get and breaks the otool -D / install_name_tool expectations the
+    # universal2 assembler relies on.
+    add_library(renderer_vk SHARED ${RENDERER_VK_SOURCES})
+  else()
+    add_library(renderer_vk MODULE ${RENDERER_VK_SOURCES})
+  endif()
+
+  openq4_apply_common(renderer_vk)
+  target_include_directories(renderer_vk PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/external/vulkan/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/external/volk"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/external/vma")
+  target_compile_definitions(renderer_vk PRIVATE
+    ${OPENQ4_SDL3_DEFINES}
+    OPENQ4_RENDERER_MODULE OPENQ4_RENDERER_VK_MODULE
+    "OPENQ4_RENDERER_BACKEND_NAME=\"vulkan\""
+    "OPENQ4_RENDERER_BACKEND_DESC=\"openQ4 native Vulkan renderer module\""
+    VMA_STATIC_VULKAN_FUNCTIONS=0
+    VMA_DYNAMIC_VULKAN_FUNCTIONS=1
+    # VK_KHR_portability_subset lives in vulkan_beta.h. Defined on every host so
+    # volk.h and the C++ translation units agree on the header set; volk exposes
+    # no beta entry points, so this adds declarations only.
+    VK_ENABLE_BETA_EXTENSIONS)
+  target_link_libraries(renderer_vk PRIVATE
+    openq4_imagetools openq4_render_geo openq4_renderer_idlib openq4_glew_dedicated)
+
+  if(OPENQ4_LINUX)
+    target_link_libraries(renderer_vk PRIVATE ${CMAKE_DL_LIBS} m)
+    target_link_options(renderer_vk PRIVATE
+      ${OPENQ4_LINK_OPTIONS_HARDENING}
+      -Wl,-z,defs -Wl,--allow-shlib-undefined
+      "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+    set_target_properties(renderer_vk PROPERTIES
+      LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/tools/build/linux_renderer_module.map")
+  elseif(OPENQ4_WINDOWS)
+    target_compile_definitions(renderer_vk PRIVATE VK_USE_PLATFORM_WIN32_KHR GLAPI=extern)
+    target_link_options(renderer_vk PRIVATE /FIXED:NO /LARGEADDRESSAWARE)
+  elseif(OPENQ4_DARWIN)
+    # The macOS client keeps its statically linked OpenGL renderer, so this
+    # module ships alongside a second copy of the renderer and idlib symbols.
+    # Exporting only GetRenderAPI keeps the two from interposing, mirroring the
+    # Linux version script; -headerpad_max_install_names leaves room for the
+    # packaging step to rewrite the install name inside the app bundle.
+    set(MACOS_RENDERER_EXPORT_LIST
+        "${CMAKE_CURRENT_SOURCE_DIR}/tools/build/macos_renderer_module.exp")
+    target_link_options(renderer_vk PRIVATE
+      "-Wl,-exported_symbols_list,${MACOS_RENDERER_EXPORT_LIST}"
+      -Wl,-dead_strip -Wl,-headerpad_max_install_names
+      "-Wl,-install_name,@loader_path/renderer-vk_${ARCH_TAG}.dylib")
+    set_target_properties(renderer_vk PROPERTIES
+      SUFFIX ".dylib"
+      LINK_DEPENDS "${MACOS_RENDERER_EXPORT_LIST}")
+  endif()
+
+  # Unlike renderer-gl, the Vulkan module keeps hidden visibility on macOS too:
+  # it is the copy that must not interpose on the statically linked renderer.
+  if(OPENQ4_WINDOWS)
+    set(OPENQ4_RENDERER_VK_VISIBILITY default)
+  else()
+    set(OPENQ4_RENDERER_VK_VISIBILITY hidden)
+  endif()
+
+  set_target_properties(renderer_vk PROPERTIES
+    OUTPUT_NAME "renderer-vk_${ARCH_TAG}" PREFIX ""
+    CXX_VISIBILITY_PRESET ${OPENQ4_RENDERER_VK_VISIBILITY})
+endif()
+
+# ---------------------------------------------------------------------------
 # Executables
 # ---------------------------------------------------------------------------
 set(OPENQ4_LINK_OPTIONS ${OPENQ4_LINK_OPTIONS_HARDENING})
@@ -511,6 +607,9 @@ target_link_options(openq4_client PRIVATE ${OPENQ4_LINK_OPTIONS})
 set_target_properties(openq4_client PROPERTIES
   OUTPUT_NAME "openQ4-client_${ARCH_TAG}" POSITION_INDEPENDENT_CODE ON)
 add_dependencies(openq4_client renderer_gl)
+if(OPENQ4_BUILD_RENDERER_VK)
+  add_dependencies(openq4_client renderer_vk)
+endif()
 
 if(OPENQ4_BUILD_DEDICATED)
   # The dedicated target drops SDL3 and the X11 helpers: it uses the same
